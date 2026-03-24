@@ -1,0 +1,14 @@
+1.0 S -> NP VP
+0.25 NP -> N N
+0.40 NP -> D N
+0.35 NP -> N
+0.60 VP -> V NP
+0.40 VP -> V ADVP
+1.0 ADVP -> ADV NP
+0.40 N -> time
+0.20 N -> flies
+0.40 N -> arrow
+1.0 D -> an
+1.0 ADV -> like
+0.50 V -> flies
+0.50 V -> like

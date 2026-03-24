@@ -1,0 +1,13 @@
+1.0 S -> NP VP
+0.60 NP -> D N
+0.40 NP -> NP PP
+0.70 VP -> V NP
+0.30 VP -> VP PP
+1.0 PP -> P NP
+0.50 D -> the
+0.50 D -> a
+0.34 N -> man
+0.33 N -> soldier
+0.33 N -> gun
+1.0 V -> shot
+1.0 P -> with
