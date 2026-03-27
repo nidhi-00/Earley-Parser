@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import sys
+import math
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Any
@@ -33,22 +34,36 @@ class Grammar:
                 if not line:
                     continue
 
-                parts = line.split()
-                if len(parts) < 4 or "->" not in parts:
-                    raise ValueError(f"Invalid grammar line {line_no}: {line}")
+                # Support both formats:
+                # Tab-delimited: "0.4\tN\ttime"  (assignment format)
+                # Arrow format:  "0.4 N -> time"  (custom format)
+                if "\t" in line:
+                    # Tab-delimited format (assignment grammars)
+                    parts = line.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    prob_str = parts[0]
+                    lhs = parts[1]
+                    rhs = tuple(parts[2].split())
+                elif "->" in line:
+                    # Arrow format (custom grammars)
+                    parts = line.split()
+                    if len(parts) < 4 or "->" not in parts:
+                        continue
+                    prob_str = parts[0]
+                    lhs = parts[1]
+                    arrow_idx = parts.index("->")
+                    rhs = tuple(parts[arrow_idx + 1:])
+                else:
+                    continue
 
                 try:
-                    prob = float(parts[0])
-                except ValueError as e:
-                    raise ValueError(f"Invalid probability on line {line_no}: {line}") from e
+                    prob = float(prob_str)
+                except ValueError:
+                    continue
 
-                lhs = parts[1]
-                if parts[2] != "->":
-                    raise ValueError(f"Expected '->' on line {line_no}: {line}")
-
-                rhs = tuple(parts[3:])
                 if not rhs:
-                    raise ValueError(f"Epsilon rules are not allowed on line {line_no}: {line}")
+                    continue
 
                 rule = Rule(lhs, rhs, prob)
                 grammar.rules_by_lhs[lhs].append(rule)
@@ -60,6 +75,9 @@ class Grammar:
         return symbol in self.nonterminals
 
     def start_symbol(self) -> str:
+        # Assignment grammars use ROOT as the start symbol
+        if "ROOT" in self.rules_by_lhs:
+            return "ROOT"
         if "S" in self.rules_by_lhs:
             return "S"
         return next(iter(self.rules_by_lhs))
@@ -111,7 +129,7 @@ class PackedState:
 class EarleyParser:
     def __init__(self, grammar: Grammar) -> None:
         self.grammar = grammar
-        self.aug_start = "ROOT"
+        self.aug_start = "__START__"
 
     def parse(
         self, words: List[str]
@@ -120,7 +138,8 @@ class EarleyParser:
         chart: List[Dict[Tuple, PackedState]] = [dict() for _ in range(n + 1)]
         agendas: List[deque[PackedState]] = [deque() for _ in range(n + 1)]
 
-        start_rule = Rule(self.aug_start, (self.grammar.start_symbol(),), 1.0)
+        real_start = self.grammar.start_symbol()
+        start_rule = Rule(self.aug_start, (real_start,), 1.0)
         start_state = self._get_or_create_state(chart[0], start_rule, 0, 0, 0)
         if start_state.add_derivation(Derivation(parts=(), score=1.0)):
             agendas[0].append(start_state)
@@ -353,16 +372,28 @@ def parse_sentences(grammar_path: str, sentence_path: str) -> None:
             chart, final_parses = parser.parse(words)
 
             if not final_parses:
-                print("NO PARSE")
-                print("NO PARSE")
+                print("NONE")
                 continue
 
-            best_state, best_idx, _ = final_parses[0]
+            best_state, best_idx, best_prob = final_parses[0]
             tree_with_spans = build_tree_with_spans(chart, best_state, best_idx)
+
+            # Skip the augmented __START__ wrapper node — get its single child
+            if tree_with_spans["label"] == "__START__" and len(tree_with_spans["children"]) == 1:
+                tree_with_spans = tree_with_spans["children"][0]
+
             tree_no_spans = strip_spans(tree_with_spans)
 
+            # Line 1: tree without spans (autograder)
             print(format_tree_no_spans(tree_no_spans))
+            # Line 2: tree with spans (human debug)
             print(format_tree_with_spans(tree_with_spans))
+            # Line 3: weight = -log2(probability)
+            if best_prob > 0:
+                weight = -math.log2(best_prob)
+            else:
+                weight = float('inf')
+            print(weight)
 
 
 def main() -> None:
