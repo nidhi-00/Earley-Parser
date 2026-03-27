@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
-from typing import Dict, List, Tuple, Optional, Iterable, Any
+from typing import Dict, List, Tuple, Optional, Any
 
 
 # -----------------------------
@@ -18,8 +18,7 @@ class Rule:
     prob: float
 
     def __str__(self) -> str:
-        rhs_str = " ".join(self.rhs)
-        return f"{self.prob} {self.lhs} -> {rhs_str}"
+        return f"{self.prob} {self.lhs} -> {' '.join(self.rhs)}"
 
 
 class Grammar:
@@ -30,7 +29,6 @@ class Grammar:
     @staticmethod
     def from_file(path: str) -> "Grammar":
         grammar = Grammar()
-        raw_rules: List[Tuple[float, str, Tuple[str, ...]]] = []
 
         with open(path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):
@@ -38,40 +36,26 @@ class Grammar:
                 if not line:
                     continue
 
-                # Expected rigid format:
-                #   0.4 NP -> N
-                #   1.0 S -> NP VP
                 parts = line.split()
                 if len(parts) < 4 or "->" not in parts:
-                    raise ValueError(
-                        f"Invalid grammar line {line_no}: {line}"
-                    )
+                    raise ValueError(f"Invalid grammar line {line_no}: {line}")
 
                 try:
                     prob = float(parts[0])
                 except ValueError as e:
-                    raise ValueError(
-                        f"Invalid probability on line {line_no}: {line}"
-                    ) from e
+                    raise ValueError(f"Invalid probability on line {line_no}: {line}") from e
 
                 lhs = parts[1]
                 if parts[2] != "->":
-                    raise ValueError(
-                        f"Expected '->' on line {line_no}: {line}"
-                    )
+                    raise ValueError(f"Expected '->' on line {line_no}: {line}")
 
                 rhs = tuple(parts[3:])
-                if len(rhs) == 0:
-                    raise ValueError(
-                        f"Epsilon rules are not allowed on line {line_no}: {line}"
-                    )
+                if not rhs:
+                    raise ValueError(f"Epsilon rules are not allowed on line {line_no}: {line}")
 
-                raw_rules.append((prob, lhs, rhs))
+                rule = Rule(lhs, rhs, prob)
+                grammar.rules_by_lhs[lhs].append(rule)
                 grammar.nonterminals.add(lhs)
-
-        for prob, lhs, rhs in raw_rules:
-            rule = Rule(lhs, rhs, prob)
-            grammar.rules_by_lhs[lhs].append(rule)
 
         return grammar
 
@@ -81,22 +65,27 @@ class Grammar:
     def start_symbol(self) -> str:
         if "S" in self.rules_by_lhs:
             return "S"
-        # Fallback: first defined LHS
         return next(iter(self.rules_by_lhs))
 
 
 # -----------------------------
-# Earley state
+# Packed derivations
 # -----------------------------
 
+@dataclass(frozen=True)
+class Derivation:
+    parts: Tuple[Any, ...]
+    score: float
+
+
 @dataclass
-class State:
+class PackedState:
     rule: Rule
     dot: int
     start: int
     end: int
-    score: float
-    backpointers: Tuple[Any, ...] = field(default_factory=tuple)
+    derivations: List[Derivation] = field(default_factory=list)
+    _seen_derivations: set = field(default_factory=set)
 
     def key(self) -> Tuple[str, Tuple[str, ...], int, int, int]:
         return (self.rule.lhs, self.rule.rhs, self.dot, self.start, self.end)
@@ -109,25 +98,18 @@ class State:
             return None
         return self.rule.rhs[self.dot]
 
-    def advance_with_terminal(self, word: str) -> "State":
-        return State(
-            rule=self.rule,
-            dot=self.dot + 1,
-            start=self.start,
-            end=self.end + 1,
-            score=self.score,
-            backpointers=self.backpointers + (word,),
-        )
+    def best_score(self) -> float:
+        if not self.derivations:
+            return 0.0
+        return max(d.score for d in self.derivations)
 
-    def advance_with_completed_child(self, child: "State") -> "State":
-        return State(
-            rule=self.rule,
-            dot=self.dot + 1,
-            start=self.start,
-            end=child.end,
-            score=self.score * child.score,
-            backpointers=self.backpointers + (child,),
-        )
+    def add_derivation(self, derivation: Derivation) -> bool:
+        signature = (derivation.parts, round(derivation.score, 15))
+        if signature in self._seen_derivations:
+            return False
+        self._seen_derivations.add(signature)
+        self.derivations.append(derivation)
+        return True
 
     def pretty(self) -> str:
         rhs = list(self.rule.rhs)
@@ -135,12 +117,12 @@ class State:
         rhs_str = " ".join(rhs)
         return (
             f"[{self.rule.lhs} -> {rhs_str}, {self.start}, {self.end}, "
-            f"score={self.score:.10g}]"
+            f"score={self.best_score():.10g}]"
         )
 
 
 # -----------------------------
-# Earley parser with Viterbi updates
+# Earley parser
 # -----------------------------
 
 class EarleyParser:
@@ -148,30 +130,21 @@ class EarleyParser:
         self.grammar = grammar
         self.aug_start = "γ"
 
-    def parse(self, words: List[str]) -> Tuple[List[Dict[Tuple, State]], List[State]]:
+    def parse(
+        self, words: List[str]
+    ) -> Tuple[List[Dict[Tuple, PackedState]], List[Tuple[PackedState, int, float]]]:
         n = len(words)
-        chart: List[Dict[Tuple, State]] = [dict() for _ in range(n + 1)]
-        agendas: List[deque[State]] = [deque() for _ in range(n + 1)]
+        chart: List[Dict[Tuple, PackedState]] = [dict() for _ in range(n + 1)]
+        agendas: List[deque[PackedState]] = [deque() for _ in range(n + 1)]
 
         start_rule = Rule(self.aug_start, (self.grammar.start_symbol(),), 1.0)
-        start_state = State(
-            rule=start_rule,
-            dot=0,
-            start=0,
-            end=0,
-            score=1.0,
-            backpointers=(),
-        )
-        self._add_to_chart(start_state, chart[0], agendas[0])
+        start_state = self._get_or_create_state(chart[0], start_rule, 0, 0, 0)
+        if start_state.add_derivation(Derivation(parts=(), score=1.0)):
+            agendas[0].append(start_state)
 
         for j in range(n + 1):
             while agendas[j]:
                 state = agendas[j].popleft()
-
-                # Skip stale state if a better version replaced it
-                current = chart[j].get(state.key())
-                if current is not state:
-                    continue
 
                 if state.is_complete():
                     self._complete(state, chart, agendas)
@@ -184,7 +157,7 @@ class EarleyParser:
                     else:
                         self._scan(state, words, chart, agendas)
 
-        final_states: List[State] = []
+        final_parses: List[Tuple[PackedState, int, float]] = []
         for st in chart[n].values():
             if (
                 st.rule.lhs == self.aug_start
@@ -192,97 +165,141 @@ class EarleyParser:
                 and st.start == 0
                 and st.end == n
             ):
-                final_states.append(st)
+                for idx, derivation in enumerate(st.derivations):
+                    final_parses.append((st, idx, derivation.score))
 
-        final_states.sort(key=lambda s: s.score, reverse=True)
-        return chart, final_states
+        final_parses.sort(key=lambda x: x[2], reverse=True)
+        return chart, final_parses
 
-    def _add_to_chart(
+    def _get_or_create_state(
         self,
-        new_state: State,
-        column: Dict[Tuple, State],
-        agenda: deque[State],
-    ) -> None:
-        """
-        Viterbi collision rule:
-        If exact same state exists, keep the one with larger score.
-        """
-        k = new_state.key()
-        old_state = column.get(k)
+        column: Dict[Tuple, PackedState],
+        rule: Rule,
+        dot: int,
+        start: int,
+        end: int,
+    ) -> PackedState:
+        key = (rule.lhs, rule.rhs, dot, start, end)
+        if key not in column:
+            column[key] = PackedState(rule=rule, dot=dot, start=start, end=end)
+        return column[key]
 
-        if old_state is None or new_state.score > old_state.score:
-            column[k] = new_state
-            agenda.append(new_state)
+    def _add_derivation_to_state(
+        self,
+        state: PackedState,
+        derivation: Derivation,
+        agenda: deque[PackedState],
+    ) -> None:
+        if state.add_derivation(derivation):
+            agenda.append(state)
 
     def _predict(
         self,
         nonterminal: str,
         j: int,
-        column: Dict[Tuple, State],
-        agenda: deque[State],
+        column: Dict[Tuple, PackedState],
+        agenda: deque[PackedState],
     ) -> None:
         for rule in self.grammar.rules_by_lhs.get(nonterminal, []):
-            predicted = State(
-                rule=rule,
-                dot=0,
-                start=j,
-                end=j,
-                score=rule.prob,
-                backpointers=(),
+            predicted = self._get_or_create_state(column, rule, 0, j, j)
+            self._add_derivation_to_state(
+                predicted,
+                Derivation(parts=(), score=rule.prob),
+                agenda,
             )
-            self._add_to_chart(predicted, column, agenda)
 
     def _scan(
         self,
-        state: State,
+        state: PackedState,
         words: List[str],
-        chart: List[Dict[Tuple, State]],
-        agendas: List[deque[State]],
+        chart: List[Dict[Tuple, PackedState]],
+        agendas: List[deque[PackedState]],
     ) -> None:
         if state.end >= len(words):
             return
 
         expected = state.next_symbol()
-        if expected == words[state.end]:
-            advanced = state.advance_with_terminal(words[state.end])
-            self._add_to_chart(advanced, chart[state.end + 1], agendas[state.end + 1])
+        word = words[state.end]
+        if expected != word:
+            return
+
+        advanced = self._get_or_create_state(
+            chart[state.end + 1],
+            state.rule,
+            state.dot + 1,
+            state.start,
+            state.end + 1,
+        )
+
+        for derivation in state.derivations:
+            new_derivation = Derivation(
+                parts=derivation.parts + (word,),
+                score=derivation.score,
+            )
+            self._add_derivation_to_state(
+                advanced,
+                new_derivation,
+                agendas[state.end + 1],
+            )
 
     def _complete(
         self,
-        completed: State,
-        chart: List[Dict[Tuple, State]],
-        agendas: List[deque[State]],
+        completed: PackedState,
+        chart: List[Dict[Tuple, PackedState]],
+        agendas: List[deque[PackedState]],
     ) -> None:
         origin_col = completed.start
         current_col = completed.end
         completed_lhs = completed.rule.lhs
 
         for waiting in list(chart[origin_col].values()):
-            sym = waiting.next_symbol()
-            if sym == completed_lhs:
-                advanced = waiting.advance_with_completed_child(completed)
-                self._add_to_chart(advanced, chart[current_col], agendas[current_col])
+            if waiting.next_symbol() != completed_lhs:
+                continue
+
+            advanced = self._get_or_create_state(
+                chart[current_col],
+                waiting.rule,
+                waiting.dot + 1,
+                waiting.start,
+                current_col,
+            )
+
+            completed_key = completed.key()
+
+            for waiting_der in waiting.derivations:
+                for child_idx, child_der in enumerate(completed.derivations):
+                    child_ref = ("STATE", completed_key, child_idx)
+                    new_derivation = Derivation(
+                        parts=waiting_der.parts + (child_ref,),
+                        score=waiting_der.score * child_der.score,
+                    )
+                    self._add_derivation_to_state(
+                        advanced,
+                        new_derivation,
+                        agendas[current_col],
+                    )
 
 
 # -----------------------------
 # Tree reconstruction
 # -----------------------------
 
-def build_tree(state: State) -> Any:
-    """
-    Convert a completed state into a nested tuple tree:
-    ('S', subtree1, subtree2, ...)
-    Terminals remain as strings.
-    """
-    if not state.is_complete():
-        raise ValueError("Can only build a tree from a completed state.")
-
+def build_tree(
+    chart: List[Dict[Tuple, PackedState]],
+    state: PackedState,
+    derivation_index: int,
+) -> Any:
+    derivation = state.derivations[derivation_index]
     children = []
-    for bp in state.backpointers:
-        if isinstance(bp, State):
-            children.append(build_tree(bp))
+
+    for part in derivation.parts:
+        if isinstance(part, tuple) and len(part) == 3 and part[0] == "STATE":
+            _, child_key, child_der_index = part
+            child_col = child_key[4]
+            child_state = chart[child_col][child_key]
+            children.append(build_tree(chart, child_state, child_der_index))
         else:
-            children.append(bp)
+            children.append(part)
 
     return tuple([state.rule.lhs] + children)
 
@@ -293,9 +310,6 @@ def tree_to_string(tree: Any, indent: int = 0) -> str:
         return f"{space}{tree}"
 
     label = tree[0]
-    if len(tree) == 1:
-        return f"{space}({label})"
-
     lines = [f"{space}({label}"]
     for child in tree[1:]:
         lines.append(tree_to_string(child, indent + 1))
@@ -307,7 +321,7 @@ def tree_to_string(tree: Any, indent: int = 0) -> str:
 # Utility printing
 # -----------------------------
 
-def print_chart(chart: List[Dict[Tuple, State]]) -> None:
+def print_chart(chart: List[Dict[Tuple, PackedState]]) -> None:
     for idx, column in enumerate(chart):
         print(f"Chart[{idx}]")
         states = list(column.values())
@@ -328,36 +342,36 @@ def parse_sentences(grammar_path: str, sentence_path: str) -> None:
                 continue
 
             words = sent.split()
-            chart, final_states = parser.parse(words)
+            chart, final_parses = parser.parse(words)
 
             print("=" * 80)
             print(f"Sentence {line_no}: {sent}")
             print("=" * 80)
             print_chart(chart)
 
-            if not final_states:
+            if not final_parses:
                 print("No parse found.\n")
                 continue
 
-            best = final_states[0]
-            best_tree = build_tree(best)
+            best_state, best_idx, best_score = final_parses[0]
+            best_tree = build_tree(chart, best_state, best_idx)
 
-            print("Best parse probability:", f"{best.score:.10g}")
+            print("Best parse probability:", f"{best_score:.10g}")
             print("Best parse tree:")
             print(tree_to_string(best_tree))
             print()
 
-            if len(final_states) > 1:
-                print("Other complete parses:")
-                for rank, st in enumerate(final_states[1:], start=2):
-                    print(f"Parse {rank} probability: {st.score:.10g}")
-                    print(tree_to_string(build_tree(st)))
+            if len(final_parses) > 1:
+                print("All complete parses:")
+                for rank, (st, deriv_idx, score) in enumerate(final_parses, start=1):
+                    print(f"Parse {rank} probability: {score:.10g}")
+                    print(tree_to_string(build_tree(chart, st, deriv_idx)))
                     print()
 
 
 def main() -> None:
     if len(sys.argv) != 3:
-        print("Usage: ./parse.py foo.gr foo.sen", file=sys.stderr)
+        print("Usage: python parse.py foo.gr foo.sen", file=sys.stderr)
         sys.exit(1)
 
     grammar_path = sys.argv[1]
