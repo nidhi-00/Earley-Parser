@@ -17,9 +17,6 @@ class Rule:
     rhs: Tuple[str, ...]
     prob: float
 
-    def __str__(self) -> str:
-        return f"{self.prob} {self.lhs} -> {' '.join(self.rhs)}"
-
 
 class Grammar:
     def __init__(self) -> None:
@@ -98,11 +95,6 @@ class PackedState:
             return None
         return self.rule.rhs[self.dot]
 
-    def best_score(self) -> float:
-        if not self.derivations:
-            return 0.0
-        return max(d.score for d in self.derivations)
-
     def add_derivation(self, derivation: Derivation) -> bool:
         signature = (derivation.parts, round(derivation.score, 15))
         if signature in self._seen_derivations:
@@ -110,15 +102,6 @@ class PackedState:
         self._seen_derivations.add(signature)
         self.derivations.append(derivation)
         return True
-
-    def pretty(self) -> str:
-        rhs = list(self.rule.rhs)
-        rhs.insert(self.dot, "·")
-        rhs_str = " ".join(rhs)
-        return (
-            f"[{self.rule.lhs} -> {rhs_str}, {self.start}, {self.end}, "
-            f"score={self.best_score():.10g}]"
-        )
 
 
 # -----------------------------
@@ -128,7 +111,7 @@ class PackedState:
 class EarleyParser:
     def __init__(self, grammar: Grammar) -> None:
         self.grammar = grammar
-        self.aug_start = "γ"
+        self.aug_start = "ROOT"
 
     def parse(
         self, words: List[str]
@@ -284,7 +267,7 @@ class EarleyParser:
 # Tree reconstruction
 # -----------------------------
 
-def build_tree(
+def build_tree_with_spans(
     chart: List[Dict[Tuple, PackedState]],
     state: PackedState,
     derivation_index: int,
@@ -297,46 +280,71 @@ def build_tree(
             _, child_key, child_der_index = part
             child_col = child_key[4]
             child_state = chart[child_col][child_key]
-            children.append(build_tree(chart, child_state, child_der_index))
+            children.append(build_tree_with_spans(chart, child_state, child_der_index))
         else:
             children.append(part)
 
-    return tuple([state.rule.lhs] + children)
+    return {
+        "label": state.rule.lhs,
+        "start": state.start,
+        "end": state.end,
+        "children": children,
+    }
 
 
-def tree_to_string(tree: Any, indent: int = 0) -> str:
-    space = "  " * indent
-    if not isinstance(tree, tuple):
-        return f"{space}{tree}"
-
-    label = tree[0]
-    lines = [f"{space}({label}"]
-    for child in tree[1:]:
-        lines.append(tree_to_string(child, indent + 1))
-    lines[-1] += ")"
-    return "\n".join(lines)
+def strip_spans(node: Any) -> Any:
+    if isinstance(node, str):
+        return node
+    return {
+        "label": node["label"],
+        "children": [strip_spans(child) for child in node["children"]],
+    }
 
 
 # -----------------------------
-# Utility printing
+# Tree formatting
 # -----------------------------
 
-def print_chart(chart: List[Dict[Tuple, PackedState]]) -> None:
-    for idx, column in enumerate(chart):
-        print(f"Chart[{idx}]")
-        states = list(column.values())
-        states.sort(key=lambda s: (s.start, s.end, s.rule.lhs, s.rule.rhs, s.dot))
-        for st in states:
-            print(st.pretty())
-        print()
+def format_tree_no_spans(node: Any) -> str:
+    if isinstance(node, str):
+        return node
 
+    label = node["label"]
+    children = node["children"]
+
+    if not children:
+        return f"({label})"
+
+    child_text = " ".join(format_tree_no_spans(child) for child in children)
+    return f"({label} {child_text})"
+
+
+def format_tree_with_spans(node: Any) -> str:
+    if isinstance(node, str):
+        return node
+
+    label = node["label"]
+    start = node["start"]
+    end = node["end"]
+    children = node["children"]
+
+    if not children:
+        return f"({label} [{start},{end}])"
+
+    child_text = " ".join(format_tree_with_spans(child) for child in children)
+    return f"({label} [{start},{end}] {child_text})"
+
+
+# -----------------------------
+# Sentence parsing
+# -----------------------------
 
 def parse_sentences(grammar_path: str, sentence_path: str) -> None:
     grammar = Grammar.from_file(grammar_path)
     parser = EarleyParser(grammar)
 
     with open(sentence_path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
+        for line in f:
             sent = line.strip()
             if not sent:
                 continue
@@ -344,29 +352,17 @@ def parse_sentences(grammar_path: str, sentence_path: str) -> None:
             words = sent.split()
             chart, final_parses = parser.parse(words)
 
-            print("=" * 80)
-            print(f"Sentence {line_no}: {sent}")
-            print("=" * 80)
-            print_chart(chart)
-
             if not final_parses:
-                print("No parse found.\n")
+                print("NO PARSE")
+                print("NO PARSE")
                 continue
 
-            best_state, best_idx, best_score = final_parses[0]
-            best_tree = build_tree(chart, best_state, best_idx)
+            best_state, best_idx, _ = final_parses[0]
+            tree_with_spans = build_tree_with_spans(chart, best_state, best_idx)
+            tree_no_spans = strip_spans(tree_with_spans)
 
-            print("Best parse probability:", f"{best_score:.10g}")
-            print("Best parse tree:")
-            print(tree_to_string(best_tree))
-            print()
-
-            if len(final_parses) > 1:
-                print("All complete parses:")
-                for rank, (st, deriv_idx, score) in enumerate(final_parses, start=1):
-                    print(f"Parse {rank} probability: {score:.10g}")
-                    print(tree_to_string(build_tree(chart, st, deriv_idx)))
-                    print()
+            print(format_tree_no_spans(tree_no_spans))
+            print(format_tree_with_spans(tree_with_spans))
 
 
 def main() -> None:
